@@ -6,3 +6,4 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 
 FORCE_CHANNEL = os.getenv("FORCE_CHANNEL")
 STORAGE_CHANNEL = int(os.getenv("STORAGE_CHANNEL"))
+ADMIN_ID = int(os.environ.get("ADMIN_ID"))
