@@ -1,186 +1,236 @@
-from pyrogram import Client, filters
-from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-import random
-import string
-import sqlite3
-import asyncio
+import uuid
+from aiogram import Bot, Dispatcher, types
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils import executor
 
 from config import *
+from database import *
 
-app = Client(
-    "videostorebot",
-    api_id=API_ID,
-    api_hash=API_HASH,
-    bot_token=BOT_TOKEN
-)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(bot)
 
-# DATABASE
-conn = sqlite3.connect("bot.db", check_same_thread=False)
-cursor = conn.cursor()
+user_uploads = {}
 
-# CREATE TABLE (FIX ERROR)
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS users(
-    user_id INTEGER PRIMARY KEY
-)
-""")
+async def is_joined(user_id):
 
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS videos(
-    code TEXT,
-    file_id TEXT
-)
-""")
+    member = await bot.get_chat_member(FORCE_GROUP, user_id)
 
-conn.commit()
+    if member.status in ["member","administrator","creator"]:
+        return True
 
-
-def generate_code():
-    return ''.join(random.choices(string.ascii_uppercase + string.digits, k=6))
-
-
-async def check_join(user_id):
-    try:
-        member = await app.get_chat_member(FORCE_CHANNEL, user_id)
-        return member.status in ["member", "administrator", "creator"]
-    except:
-        return False
+    return False
 
 
 def join_keyboard():
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📢 Join Channel", url=f"https://t.me/{FORCE_CHANNEL}")],
-        [InlineKeyboardButton("✅ Verify", callback_data="verify")]
-    ])
+    kb = InlineKeyboardMarkup()
 
-
-@app.on_message(filters.command("start"))
-async def start(client, message):
-
-    user_id = message.from_user.id
-
-    cursor.execute("INSERT OR IGNORE INTO users VALUES (?)",(user_id,))
-    conn.commit()
-
-    if len(message.command) > 1:
-
-        code = message.command[1]
-
-        if not await check_join(user_id):
-
-            await message.reply_text(
-                "⚠️ Untuk mendapatkan video\nSilahkan join channel dulu",
-                reply_markup=join_keyboard()
-            )
-            return
-
-        cursor.execute("SELECT file_id FROM videos WHERE code=?",(code,))
-        data = cursor.fetchone()
-
-        if data:
-            await message.reply_video(data[0])
-
-    else:
-
-        await message.reply_text(
-            "🤖 Kirim CODE video untuk mendapatkan file"
+    kb.add(
+        InlineKeyboardButton(
+            "Join Group",
+            url=f"https://t.me/{FORCE_GROUP.replace('@','')}"
         )
-
-
-@app.on_callback_query(filters.regex("verify"))
-async def verify(client, callback):
-
-    user_id = callback.from_user.id
-
-    if await check_join(user_id):
-
-        await callback.message.edit_text(
-            "✅ Verifikasi berhasil\nSilahkan kirim CODE video"
-        )
-
-    else:
-
-        await callback.answer(
-            "❌ Kamu belum join channel",
-            show_alert=True
-        )
-
-
-@app.on_message(filters.video & filters.user(ADMIN_ID))
-async def upload_video(client, message):
-
-    progress_msg = await message.reply_text("⬆️ Upload dimulai...")
-
-    video = message.video
-    size = video.file_size / (1024*1024)
-
-    sent = await message.copy(STORAGE_CHANNEL)
-
-    code = generate_code()
-
-    cursor.execute(
-        "INSERT INTO videos VALUES (?,?)",
-        (code, sent.video.file_id)
     )
 
-    conn.commit()
-
-    link = f"https://t.me/{(await app.get_me()).username}?start={code}"
-
-    await progress_msg.edit_text(
-
-        f"✅ Upload selesai\n\n"
-        f"📦 Size : {size:.2f} MB\n"
-        f"🧾 CODE : `{code}`\n"
-        f"🔗 LINK : {link}"
+    kb.add(
+        InlineKeyboardButton(
+            "Verify Join",
+            callback_data="verify"
+        )
     )
 
+    return kb
 
-@app.on_message(filters.text)
-async def get_by_code(client, message):
 
-    code = message.text.strip()
+@dp.message_handler(commands=['start'])
+async def start(msg: types.Message):
 
-    cursor.execute("SELECT file_id FROM videos WHERE code=?",(code,))
-    data = cursor.fetchone()
+    user_id = msg.from_user.id
 
-    if not data:
-        return
+    users.update_one(
+        {"user_id":user_id},
+        {"$set":{"user_id":user_id}},
+        upsert=True
+    )
 
-    if not await check_join(message.from_user.id):
+    args = msg.get_args()
 
-        await message.reply_text(
-            "⚠️ Join channel dulu",
+    if not await is_joined(user_id):
+        await msg.answer(
+            "Join group dulu untuk menggunakan bot",
             reply_markup=join_keyboard()
         )
         return
 
-    await message.reply_video(data[0])
+    if args:
 
+        link = links.find_one({"code":args})
 
-@app.on_message(filters.command("broadcast") & filters.user(ADMIN_ID))
-async def broadcast(client, message):
+        if not link:
+            await msg.answer("Link tidak valid")
+            return
 
-    if len(message.command) < 2:
-        return await message.reply_text("Gunakan: /broadcast pesan")
+        files_list = link["files"]
 
-    text = message.text.split(None,1)[1]
+        await send_files(msg.chat.id, files_list, 0)
 
-    cursor.execute("SELECT user_id FROM users")
-    users = cursor.fetchall()
+        return
 
-    success = 0
+    kb = InlineKeyboardMarkup()
 
-    for user in users:
-        try:
-            await app.send_message(user[0], text)
-            success += 1
-        except:
-            pass
+    kb.add(
+        InlineKeyboardButton("Upload",callback_data="upload"),
+        InlineKeyboardButton("Create Link",callback_data="create")
+    )
 
-    await message.reply_text(
-        f"📢 Broadcast selesai\nTerkirim ke {success} user"
+    await msg.answer(
+        "Welcome to File Store Bot",
+        reply_markup=kb
     )
 
 
-app.run()
+@dp.callback_query_handler(lambda c: c.data=="verify")
+async def verify(call: types.CallbackQuery):
+
+    if await is_joined(call.from_user.id):
+
+        await call.message.edit_text(
+            "Verified! sekarang kamu bisa menggunakan bot"
+        )
+
+    else:
+
+        await call.answer(
+            "Kamu belum join group",
+            show_alert=True
+        )
+
+
+@dp.callback_query_handler(lambda c: c.data=="upload")
+async def upload(call: types.CallbackQuery):
+
+    user_uploads[call.from_user.id] = []
+
+    await call.message.answer(
+        "Silahkan upload file / video"
+    )
+
+
+@dp.message_handler(content_types=['video','document','photo'])
+async def save_file(msg: types.Message):
+
+    user_id = msg.from_user.id
+
+    if user_id not in user_uploads:
+        return
+
+    sent = await msg.copy_to(DATABASE_CHANNEL)
+
+    user_uploads[user_id].append(sent.message_id)
+
+    await msg.reply(
+        f"File disimpan ({len(user_uploads[user_id])})"
+    )
+
+
+@dp.callback_query_handler(lambda c: c.data=="create")
+async def create(call: types.CallbackQuery):
+
+    user_id = call.from_user.id
+
+    files_list = user_uploads.get(user_id)
+
+    if not files_list:
+        await call.answer("Upload file dulu")
+        return
+
+    code = str(uuid.uuid4())[:8]
+
+    links.insert_one({
+        "code":code,
+        "files":files_list
+    })
+
+    link = f"https://t.me/{(await bot.get_me()).username}?start={code}"
+
+    await call.message.answer(
+        f"Link kamu:\n{link}"
+    )
+
+
+async def send_files(chat_id, files_list, page):
+
+    per_page = 10
+
+    start = page * per_page
+
+    end = start + per_page
+
+    current = files_list[start:end]
+
+    for msg_id in current:
+
+        await bot.copy_message(
+            chat_id,
+            DATABASE_CHANNEL,
+            msg_id
+        )
+
+    total_pages = (len(files_list)-1)//per_page
+
+    kb = InlineKeyboardMarkup()
+
+    if page>0:
+        kb.insert(
+            InlineKeyboardButton(
+                "Prev",
+                callback_data=f"page_{page-1}"
+            )
+        )
+
+    if page<total_pages:
+        kb.insert(
+            InlineKeyboardButton(
+                "Next",
+                callback_data=f"page_{page+1}"
+            )
+        )
+
+    kb.add(
+        InlineKeyboardButton(
+            "Join Group",
+            url=f"https://t.me/{FORCE_GROUP.replace('@','')}"
+        )
+    )
+
+    await bot.send_message(
+        chat_id,
+        f"Page {page+1}/{total_pages+1}",
+        reply_markup=kb
+    )
+
+
+@dp.message_handler(commands=['broadcast'])
+async def broadcast(msg: types.Message):
+
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    text = msg.get_args()
+
+    for u in users.find():
+
+        try:
+
+            await bot.send_message(
+                u["user_id"],
+                text
+            )
+
+        except:
+            pass
+
+    await msg.answer("Broadcast sent")
+
+
+if __name__ == "__main__":
+    executor.start_polling(dp)
